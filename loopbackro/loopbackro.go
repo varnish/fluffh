@@ -1,7 +1,5 @@
-// Copyright 2019 the Go-FUSE Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
+// Package loopbackro implements a read-only loopback file system.
+// We'll use this as a base to implement a HTTP based file system with CDB-indices for directories.
 package loopbackro
 
 import (
@@ -19,43 +17,62 @@ import (
 // underlying POSIX file system.
 type LoopbackRoot struct {
 	// The path to the root of the underlying file system.
-	Path string
+	Path string // Todo: This should be a base URL for httpfs.
 
 	// The device on which the Path resides. This must be set if
 	// the underlying filesystem crosses file systems.
-	Dev uint64
+	Dev uint64 // Todo: I think we can ignore this for httpfs.
 
 	// NewNode returns a new InodeEmbedder to be used to respond
 	// to a LOOKUP opcode. If not set, use a LoopbackNode.
 	NewNode func(rootData *LoopbackRoot, parent *fs.Inode, name string, st *syscall.Stat_t) fs.InodeEmbedder
+	// Todo: We should probably have a NewNode for httpfs. This would be a function that creates a new InodeEmbedder
+	//       for a given URL. The URL would be the base URL of the httpfs and the name would be the path to the file.
 
 	// RootNode is the root of the Loopback. This must be set if
 	// the Loopback file system is not the root of the FUSE
 	// mount. It is set automatically by NewLoopbackRoot.
-	RootNode fs.InodeEmbedder
+	RootNode fs.InodeEmbedder // Todo: I think we can ignore this for httpfs.
 }
 
-func (r *LoopbackRoot) newNode(parent *fs.Inode, name string, st *syscall.Stat_t) fs.InodeEmbedder {
-	if r.NewNode != nil {
-		return r.NewNode(r, parent, name, st)
+func (root *LoopbackRoot) newNode(parentInode *fs.Inode, nodeName string, stat *syscall.Stat_t) fs.InodeEmbedder {
+	// Check if a custom node creation function is provided.
+	// If so, use it to create and return a new InodeEmbedder.
+	if root.NewNode != nil {
+		return root.NewNode(root, parentInode, nodeName, stat)
 	}
+
+	// If no custom node creation function is provided,
+	// create and return a default LoopbackNode.
 	return &LoopbackNode{
-		RootData: r,
+		RootData: root, // Reference back to the root of the loopback filesystem.
 	}
 }
 
-func (r *LoopbackRoot) idFromStat(st *syscall.Stat_t) fs.StableAttr {
-	// Compose inode number by mixing device and inode numbers.
-	swapped := (uint64(st.Dev) << 32) | (uint64(st.Dev) >> 32)
-	swappedRootDev := (r.Dev << 32) | (r.Dev >> 32)
+// idFromStat generates a unique StableAttr from a syscall.Stat_t.
+// We could perhaps change this and use the absolute URL through a hash as the inode id.
+func (root *LoopbackRoot) idFromStat(stat *syscall.Stat_t) fs.StableAttr {
+	// Swap the high and low 32 bits of the device number to create a unique identifier.
+	// This helps in generating a unique inode number by combining device and inode information.
+	deviceSwapped := (uint64(stat.Dev) << 32) | (uint64(stat.Dev) >> 32)
+
+	// Similarly, swap the high and low 32 bits of the root device number.
+	rootDeviceSwapped := (root.Dev << 32) | (root.Dev >> 32)
+
+	// Generate a unique inode number by XOR-ing the swapped device numbers with the original inode number.
+	// This ensures that inode numbers are unique across different devices.
+	uniqueInode := (deviceSwapped ^ rootDeviceSwapped) ^ stat.Ino
+
+	// Construct and return the StableAttr struct with the computed attributes.
 	return fs.StableAttr{
-		Mode: uint32(st.Mode),
-		Gen:  1,
-		Ino:  (swapped ^ swappedRootDev) ^ st.Ino,
+		Mode: uint32(stat.Mode), // File mode (permissions and file type).
+		Gen:  1,                 // Generation number (can be used for versioning; set to 1 as a default).
+		Ino:  uniqueInode,       // Unique inode number.
 	}
 }
 
 // LoopbackNode is a filesystem node in a loopback file system.
+// A node is a file, directory, symbolic link, or other filesystem object.
 type LoopbackNode struct {
 	fs.Inode
 
@@ -65,6 +82,8 @@ type LoopbackNode struct {
 
 var _ = (fs.NodeStatfser)((*LoopbackNode)(nil))
 
+// Statfs fills in the filesystem information for the underlying file system.
+// Todo: We should probably just return zeros here.
 func (n *LoopbackNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 	s := syscall.Statfs_t{}
 	err := syscall.Statfs(n.path(), &s)
@@ -75,7 +94,7 @@ func (n *LoopbackNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.
 	return fs.OK
 }
 
-// path returns the full path to the file in the underlying file system.
+// root returns the root of the loopback filesystem.
 func (n *LoopbackNode) root() *fs.Inode {
 	var rootNode *fs.Inode
 	if n.RootData.RootNode != nil {
@@ -86,6 +105,7 @@ func (n *LoopbackNode) root() *fs.Inode {
 	return rootNode
 }
 
+// path returns the full path of the current node in the underlying filesystem.
 func (n *LoopbackNode) path() string {
 	path := n.Path(n.root())
 	return filepath.Join(n.RootData.Path, path)
@@ -93,6 +113,7 @@ func (n *LoopbackNode) path() string {
 
 var _ = (fs.NodeLookuper)((*LoopbackNode)(nil))
 
+// Lookup looks up a child node with the given name.
 func (n *LoopbackNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	p := filepath.Join(n.path(), name)
 
@@ -111,23 +132,33 @@ func (n *LoopbackNode) Lookup(ctx context.Context, name string, out *fuse.EntryO
 var _ = (fs.NodeReadlinker)((*LoopbackNode)(nil))
 
 func (n *LoopbackNode) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
+	// Obtain the full underlying filesystem path of the symlink.
 	p := n.path()
-
+	// Start with a reasonably small buffer and keep doubling its size
+	// until the entire target of the symlink fits.
 	for l := 256; ; l *= 2 {
+		// Create a buffer of size l.
 		buf := make([]byte, l)
+		// Read the symlink target into buf.
 		sz, err := syscall.Readlink(p, buf)
 		if err != nil {
+			// If there's an error, convert it to a fuse.Errno and return.
 			return nil, fs.ToErrno(err)
 		}
-
+		// If sz is smaller than the buffer length, we got the whole target.
+		// Resize the buffer to the actual size and return it.
 		if sz < len(buf) {
 			return buf[:sz], 0
 		}
+		// Otherwise, increase l and try again with a bigger buffer.
 	}
 }
 
 var _ = (fs.NodeOpener)((*LoopbackNode)(nil))
 
+// Open opens the file or directory represented by the current node.
+// It returns a file handle that can be used to read the file or directory.
+// Todo: For httpfs we should construct a http request here and perhaps ask for the first chunk.
 func (n *LoopbackNode) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
 	flags = flags &^ syscall.O_APPEND
 	p := n.path()
@@ -157,27 +188,41 @@ func (n *LoopbackNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno
 
 var _ = (fs.NodeGetattrer)((*LoopbackNode)(nil))
 
-func (n *LoopbackNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	if f != nil {
-		if fga, ok := f.(fs.FileGetattrer); ok {
-			return fga.Getattr(ctx, out)
+func (node *LoopbackNode) Getattr(ctx context.Context, fileHandle fs.FileHandle, attrOut *fuse.AttrOut) syscall.Errno {
+	// If a file handle is provided and it implements the FileGetattrer interface,
+	// delegate the getattr operation to the file handle's Getattr method.
+	if fileHandle != nil {
+		if fileGetAttrer, ok := fileHandle.(fs.FileGetattrer); ok {
+			return fileGetAttrer.Getattr(ctx, attrOut)
 		}
 	}
 
-	p := n.path()
+	// Retrieve the full path of the current file or directory in the underlying filesystem.
+	filePath := node.path()
 
-	var err error
-	st := syscall.Stat_t{}
-	if &n.Inode == n.Root() {
-		err = syscall.Stat(p, &st)
+	var (
+		err      error
+		statInfo syscall.Stat_t
+	)
+
+	// Determine whether the current node is the root of the filesystem.
+	// - If it is the root, use syscall.Stat to follow symbolic links.
+	// - Otherwise, use syscall.Lstat to avoid following symbolic links.
+	if &node.Inode == node.Root() {
+		err = syscall.Stat(filePath, &statInfo)
 	} else {
-		err = syscall.Lstat(p, &st)
+		err = syscall.Lstat(filePath, &statInfo)
 	}
 
+	// If an error occurred while retrieving file attributes, convert it to a FUSE errno and return.
 	if err != nil {
 		return fs.ToErrno(err)
 	}
-	out.FromStat(&st)
+
+	// Populate the AttrOut structure with the retrieved file attributes.
+	attrOut.FromStat(&statInfo)
+
+	// Indicate successful completion of the getattr operation.
 	return fs.OK
 }
 
