@@ -14,7 +14,7 @@ use case.
 ## Why hanwen/go-fuse?
 
 hanwen/go-fuse seems a bit more modern than bazil/fuse. While having a steeper learning curve, it grants a lot more
-control over the filesystem. 
+control over the filesystem.
 
 ## Design
 
@@ -25,14 +25,14 @@ cumbersome data ingest pipeline of CVMFS.
 ## Caveats
 
 * Filesystems is mounted read only.
-* File are not assumed to change.
+* File are not assumed to change, but they can. S3 does support versioning and if the CDB files somehow can reference a
+  version, we can support this.
 * Directories can change.
 
 ## Caching strategy
 
 The client (FLUFFH) will not do any meaningful caching. Every time a file is access or a directory is listed, the client
-will
-make an HTTP request re-download the CDB file or the object.
+will make an HTTP request re-download the CDB file or the object.
 
 The client will do read-ahead caching for files.
 

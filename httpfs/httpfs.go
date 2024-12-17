@@ -65,7 +65,7 @@ func fetchDirListing(u string) (DirListing, error) {
 		return nil, fmt.Errorf("url.JoinPath: %w", err)
 	}
 
-	resp, err := http.Get(u + indexFile)
+	resp, err := http.Get(u)
 	if err != nil {
 		return nil, err
 	}
