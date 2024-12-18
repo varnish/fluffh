@@ -1,10 +1,11 @@
 package httpfs
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/colinmarc/cdb"
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"io"
@@ -22,14 +23,15 @@ const (
 	chunkSize int64 = 1 << 20 // 1MB
 )
 
-// HttpRoot represents the root of the HTTP-based filesystem.
-type HttpRoot struct {
+// httpRoot represents the root of the HTTP-based filesystem.
+type httpRoot struct {
 	BaseURL string
 	// NewNode creates a new node given a URL and metadata.
-	NewNode func(root *HttpRoot, parent *fs.Inode, name, url string, meta FileMeta) fs.InodeEmbedder
+	NewNode func(root *httpRoot, parent *fs.Inode, name, url string, meta FileMeta) fs.InodeEmbedder
 }
 
 // FileMeta holds the metadata for a file or directory as read from index.json.
+// Exported because we need to marshal/unmarshal it.
 type FileMeta struct {
 	Size uint64 `json:"size" msg:"size"`
 	UID  uint32 `json:"uid" msg:"uid"`
@@ -39,53 +41,103 @@ type FileMeta struct {
 }
 
 // Directory listing structure: map of filename to FileMeta.
-type DirListing map[string]FileMeta
+type dirListing map[string]FileMeta
 
-// HttpNode represents a file or directory node in the HTTP filesystem.
-type HttpNode struct {
+// httpNode represents a file or directory node in the HTTP filesystem.
+type httpNode struct {
 	fs.Inode
-	RootData *HttpRoot
+	RootData *httpRoot
 	URL      string
 	IsDir    bool
 	Meta     FileMeta
 }
 
-// Ensure HttpNode implements certain interfaces:
-var _ fs.NodeStatfser = (*HttpNode)(nil)
-var _ fs.NodeLookuper = (*HttpNode)(nil)
-var _ fs.NodeGetattrer = (*HttpNode)(nil)
-var _ fs.NodeReaddirer = (*HttpNode)(nil)
-var _ fs.NodeOpener = (*HttpNode)(nil)
+// Ensure httpNode implements certain interfaces:
+var _ fs.NodeStatfser = (*httpNode)(nil)
+var _ fs.NodeLookuper = (*httpNode)(nil)
+var _ fs.NodeGetattrer = (*httpNode)(nil)
+var _ fs.NodeReaddirer = (*httpNode)(nil)
+var _ fs.NodeOpener = (*httpNode)(nil)
 
-// fetchDirListing fetches and parses an index.json for a directory.
-func fetchDirListing(u string) (DirListing, error) {
-	var err error
-	u, err = url.JoinPath(u, indexFile)
-	if err != nil {
-		return nil, fmt.Errorf("url.JoinPath: %w", err)
-	}
-
+func getCDB(u string) (*cdb.CDB, error) {
 	resp, err := http.Get(u)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("http.Get: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		return nil, syscall.ENOENT
 	}
-	var listing DirListing
-	if err := json.NewDecoder(resp.Body).Decode(&listing); err != nil {
-		return nil, fmt.Errorf("json.Decode'%s': %w", u, err)
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("io.ReadAll: %w", err)
 	}
-	// Compute INO from URL if not set
-	for name, meta := range listing {
-		entryURL := u + name
-		if meta.INO == 0 {
-			meta.INO = hashStringToUint64(entryURL)
-			listing[name] = meta
+	// make reader
+	readerBytes := bytes.NewReader(bodyBytes)
+	// create cdb
+	dbase, err := cdb.New(readerBytes, nil)
+	if err != nil {
+		return nil, fmt.Errorf("cdb.New: %w", err)
+	}
+	return dbase, nil
+}
+
+// fetchDirListing fetches and parses an index.json for a directory.
+func fetchDirListing(u string) (dirListing, error) {
+	var err error
+	u, err = url.JoinPath(u, indexFile)
+	if err != nil {
+		return nil, fmt.Errorf("url.JoinPath: %w", err)
+	}
+	dbase, err := getCDB(u)
+	if err != nil {
+		return nil, fmt.Errorf("getCDB: %w", err)
+	}
+	// iterate over the cdb
+	iter := dbase.Iter()
+	var listing = make(dirListing)
+	i := 0
+	for {
+
+		// unmarshal the record into a FileMeta
+		var meta FileMeta
+		if _, err := meta.UnmarshalMsg(iter.Value()); err != nil {
+			return nil, fmt.Errorf("json.Unmarshal: %w", err)
+		}
+		listing[string(iter.Key())] = meta
+		i++
+		// advance to the next record
+		if !iter.Next() {
+			break // no more records
 		}
 	}
 	return listing, nil
+}
+
+func lookupInDir(u, filename string) (*FileMeta, error) {
+	var err error
+	u, err = url.JoinPath(u, indexFile)
+	if err != nil {
+		return nil, fmt.Errorf("url.JoinPath: %w", err)
+	}
+	dbase, err := getCDB(u)
+	if err != nil {
+		return nil, fmt.Errorf("getCDB: %w", err)
+	}
+
+	// lookup in the cdb
+	var meta FileMeta
+	value, err := dbase.Get([]byte(filename))
+	if err != nil {
+		return nil, fmt.Errorf("cdb.Get: %w", err)
+	}
+	if value == nil {
+		return nil, syscall.ENOENT
+	}
+	if _, err := meta.UnmarshalMsg(value); err != nil {
+		return nil, fmt.Errorf("json.Unmarshal: %w", err)
+	}
+	return &meta, nil
 }
 
 // NewHttpRoot initializes the HTTP root node.
@@ -93,12 +145,12 @@ func NewHttpRoot(baseURL string) (fs.InodeEmbedder, error) {
 	if !strings.HasSuffix(baseURL, "/") {
 		baseURL += "/"
 	}
-	root := &HttpRoot{
+	root := &httpRoot{
 		BaseURL: baseURL,
 	}
 	// Default NewNode function if none provided
-	root.NewNode = func(r *HttpRoot, parent *fs.Inode, name, url string, meta FileMeta) fs.InodeEmbedder {
-		return &HttpNode{
+	root.NewNode = func(r *httpRoot, parent *fs.Inode, name, url string, meta FileMeta) fs.InodeEmbedder {
+		return &httpNode{
 			RootData: r,
 			URL:      url,
 			IsDir:    (meta.Mode&syscall.S_IFDIR != 0),
@@ -123,7 +175,7 @@ func NewHttpRoot(baseURL string) (fs.InodeEmbedder, error) {
 		INO:  hashStringToUint64(baseURL),
 	}
 
-	rootNode := &HttpNode{
+	rootNode := &httpNode{
 		RootData: root,
 		URL:      baseURL,
 		IsDir:    true,
@@ -133,13 +185,13 @@ func NewHttpRoot(baseURL string) (fs.InodeEmbedder, error) {
 	return rootNode, nil
 }
 
-func (n *HttpNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
+func (n *httpNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 	// Just return zeros as suggested.
 	return 0
 }
 
 // Getattr retrieves attributes for this node.
-func (n *HttpNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+func (n *httpNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	// If it's a directory, we have Meta already. If it's a file, we also have Meta.
 	out.Mode = n.Meta.Mode
 	out.Size = n.Meta.Size
@@ -152,7 +204,8 @@ func (n *HttpNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.Attr
 }
 
 // Lookup a child node by name.
-func (n *HttpNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+func (n *httpNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	// Obviously we can't look up children of a file, duh.
 	if !n.IsDir {
 		// Not a directory, no children.
 		return nil, syscall.ENOENT
@@ -166,15 +219,7 @@ func (n *HttpNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 
 	meta, ok := listing[name]
 	if !ok {
-		// Maybe it's a directory name that ends with '/', try that
-		if !strings.HasSuffix(name, "/") {
-			nameDir := name + "/"
-			meta, ok = listing[nameDir]
-			name = nameDir
-		}
-		if !ok {
-			return nil, syscall.ENOENT
-		}
+		return nil, syscall.ENOENT
 	}
 
 	// Construct URL for this entry
@@ -197,7 +242,7 @@ func (n *HttpNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 }
 
 // Readdir reads the directory contents.
-func (n *HttpNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+func (n *httpNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	if !n.IsDir {
 		return nil, syscall.ENOTDIR
 	}
@@ -222,7 +267,7 @@ func (n *HttpNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 
 // Open opens a file. For directories, this might be used to read directories if needed.
 // For files, it will initiate an HTTP GET request.
-func (n *HttpNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+func (n *httpNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	if n.IsDir {
 		// Directories: no special handle needed, unless we want to stream index.json.
 		// Just return nil and OK.
@@ -238,12 +283,12 @@ func (n *HttpNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 	return fh, 0, 0
 }
 
-var _ fs.FileHandle = (*HttpFileHandle)(nil)
-var _ fs.FileReader = (*HttpFileHandle)(nil)
-var _ fs.FileReleaser = (*HttpFileHandle)(nil)
+var _ fs.FileHandle = (*httpFileHandle)(nil)
+var _ fs.FileReader = (*httpFileHandle)(nil)
+var _ fs.FileReleaser = (*httpFileHandle)(nil)
 
-// HttpFileHandle represents a file handle for an HTTP-based file.
-type HttpFileHandle struct {
+// httpFileHandle represents a file handle for an HTTP-based file.
+type httpFileHandle struct {
 	URL        string       // URL of the remote file
 	HTTPClient *http.Client // HTTP client to make requests
 	FileSize   int64        // Size of the remote file
@@ -252,9 +297,9 @@ type HttpFileHandle struct {
 	chunkBuf map[int64][]byte // Cache for chunks
 }
 
-// NewHttpFileHandle initializes a new HttpFileHandle.
+// NewHttpFileHandle initializes a new httpFileHandle.
 // It performs a HEAD request to determine the file size.
-func NewHttpFileHandle(url string, client *http.Client) (*HttpFileHandle, error) {
+func NewHttpFileHandle(url string, client *http.Client) (*httpFileHandle, error) {
 	if client == nil {
 		client = http.DefaultClient
 	}
@@ -287,7 +332,7 @@ func NewHttpFileHandle(url string, client *http.Client) (*HttpFileHandle, error)
 		return nil, fmt.Errorf("parsing Content-Length: %w", err)
 	}
 
-	return &HttpFileHandle{
+	return &httpFileHandle{
 		URL:        url,
 		HTTPClient: client,
 		FileSize:   fileSize,
@@ -297,7 +342,7 @@ func NewHttpFileHandle(url string, client *http.Client) (*HttpFileHandle, error)
 
 // Read fetches a specific range of bytes from the remote file.
 // It uses chunk-based HTTP range requests to optimize memory usage and performance.
-func (f *HttpFileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+func (f *httpFileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	// Validate the offset
 	if off < 0 || off >= f.FileSize {
 		return nil, syscall.EINVAL
@@ -352,7 +397,7 @@ func (f *HttpFileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse
 }
 
 // getChunk retrieves a specific chunk either from the cache or by fetching it via HTTP.
-func (f *HttpFileHandle) getChunk(chunkIndex int64) ([]byte, error) {
+func (f *httpFileHandle) getChunk(chunkIndex int64) ([]byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -400,7 +445,7 @@ func (f *HttpFileHandle) getChunk(chunkIndex int64) ([]byte, error) {
 	return chunkData, nil
 }
 
-func (f *HttpFileHandle) Release(ctx context.Context) syscall.Errno {
+func (f *httpFileHandle) Release(ctx context.Context) syscall.Errno {
 	// f.Body.Close()
 	// will the garbage collector take care of this?
 	return fs.OK

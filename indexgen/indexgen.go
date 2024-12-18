@@ -16,25 +16,22 @@ import (
 )
 
 // statToMetadata gathers metadata for a file or directory
-func statToMetadata(path string, info os.FileInfo) (*httpfs.Metadata, error) {
+func statToMetadata(path string, info os.FileInfo) (*httpfs.FileMeta, error) {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
 		return nil, fmt.Errorf("failed to get raw syscall.Stat_t for %s", path)
 	}
 
-	metadata := &httpfs.Metadata{
-		Inode:      stat.Ino,
-		Type:       "file",
-		AccessBits: uint32(stat.Mode),
-		UID:        stat.Uid,
-		GID:        stat.Gid,
-		Size:       info.Size(),
-		Modified:   stat.Mtimespec.Sec,
-		Created:    stat.Ctimespec.Sec,
+	metadata := &httpfs.FileMeta{
+		Size: uint64(info.Size()),
+		UID:  stat.Uid,
+		GID:  stat.Gid,
+		Mode: uint32(info.Mode()),
+		INO:  stat.Ino,
 	}
 
 	if info.IsDir() {
-		metadata.Type = "dir"
+		metadata.Mode |= syscall.S_IFDIR
 		metadata.Size = 0
 	}
 
