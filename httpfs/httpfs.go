@@ -19,7 +19,7 @@ import (
 //go:generate go run github.com/tinylib/msgp
 
 const (
-	indexFile       = "index.json"
+	indexFile       = "index.cdb"
 	chunkSize int64 = 1 << 20 // 1MB
 )
 
@@ -30,7 +30,7 @@ type httpRoot struct {
 	NewNode func(root *httpRoot, parent *fs.Inode, name, url string, meta FileMeta) fs.InodeEmbedder
 }
 
-// FileMeta holds the metadata for a file or directory as read from index.json.
+// FileMeta holds the metadata for a file or directory as read from the index CDB
 // Exported because we need to marshal/unmarshal it.
 type FileMeta struct {
 	Size uint64 `json:"size" msg:"size"`
@@ -82,7 +82,7 @@ func getCDB(u string) (*cdb.CDB, error) {
 	return dbase, nil
 }
 
-// fetchDirListing fetches and parses an index.json for a directory.
+// fetchDirListing fetches the directory listing from the index file.
 func fetchDirListing(u string) (dirListing, error) {
 	var err error
 	u, err = url.JoinPath(u, indexFile)
@@ -102,7 +102,7 @@ func fetchDirListing(u string) (dirListing, error) {
 		// unmarshal the record into a FileMeta
 		var meta FileMeta
 		if _, err := meta.UnmarshalMsg(iter.Value()); err != nil {
-			return nil, fmt.Errorf("json.Unmarshal: %w", err)
+			return nil, fmt.Errorf("unmarshal metadata: %w", err)
 		}
 		listing[string(iter.Key())] = meta
 		i++
@@ -135,7 +135,7 @@ func lookupInDir(u, filename string) (*FileMeta, error) {
 		return nil, syscall.ENOENT
 	}
 	if _, err := meta.UnmarshalMsg(value); err != nil {
-		return nil, fmt.Errorf("json.Unmarshal: %w", err)
+		return nil, fmt.Errorf("unmarshal metadata: %w", err)
 	}
 	return &meta, nil
 }
@@ -153,15 +153,14 @@ func NewHttpRoot(baseURL string) (fs.InodeEmbedder, error) {
 		return &httpNode{
 			RootData: r,
 			URL:      url,
-			IsDir:    (meta.Mode&syscall.S_IFDIR != 0),
+			IsDir:    meta.Mode&syscall.S_IFDIR != 0,
 			Meta:     meta,
 		}
 	}
 
-	// Fetch root dir metadata from index.json (or set default if needed) to see that it's a directory.
+	// Fetch root dir metadata to ensure it's a directory.
 	_, err := fetchDirListing(baseURL)
 	if err != nil {
-		// No index.json at root means something's wrong.
 		return nil, err
 	}
 
@@ -269,7 +268,6 @@ func (n *httpNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 // For files, it will initiate an HTTP GET request.
 func (n *httpNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	if n.IsDir {
-		// Directories: no special handle needed, unless we want to stream index.json.
 		// Just return nil and OK.
 		return nil, 0, 0
 	}
