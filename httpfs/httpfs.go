@@ -399,43 +399,59 @@ func (f *httpFileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse
 		return nil, syscall.EINVAL
 	}
 
-	// Determine the number of bytes to read
+	// Determine the number of bytes to read, shortening it if it goes past the end of the file.
 	readLength := int64(len(dest))
 	if off+readLength > f.FileSize {
 		readLength = f.FileSize - off
 	}
 
-	chunkIndex := off / chunkSize
+	firstChunk := off / chunkSize // index of the FIRST chunk to read from
+	lastChunk := (off + readLength - 1) / chunkSize
 
-	chunkData, err := f.getChunk(chunkIndex)
-	if err != nil {
-		slog.Error("Read: getChunk failed", "url", f.URL, "offset", off, "error", err)
-		return nil, fs.ToErrno(err)
+	// Read the data into memory:
+	for i := firstChunk; i <= lastChunk; i++ {
+		_, exists := f.chunkBuf[i]
+		if !exists {
+			if err := f.readChunkIntoCache(i); err != nil {
+				slog.Error("Read: readChunkIntoCache failed", "url", f.URL, "offset", off, "error", err)
+				return nil, fs.ToErrno(err)
+			}
+		}
 	}
 
-	chunkStart := chunkIndex * chunkSize
-	relativeOffset := off - chunkStart
-	bytesToRead := readLength
-
-	if relativeOffset+bytesToRead > int64(len(chunkData)) {
-		bytesToRead = int64(len(chunkData)) - relativeOffset
+	// we assume all the chunks are present in the cache now.
+	// Now we're ready to copy the data into the destination buffer.
+	for i := firstChunk; i <= lastChunk; i++ {
+		if i == firstChunk {
+			copy(dest, f.chunkBuf[i][off%chunkSize:])
+			slog.Debug("Read: copied first chunk", "url", f.URL, "offset", off, "bytes_read", len(f.chunkBuf[i][off%chunkSize:]))
+			continue
+		}
+		if i == lastChunk {
+			bytesToRead := readLength - (chunkSize - off%chunkSize)
+			copy(dest[chunkSize-off%chunkSize:], f.chunkBuf[i][:bytesToRead])
+			slog.Debug("Read: copied last chunk", "url", f.URL, "offset", off, "bytes_read", bytesToRead)
+			continue
+		}
+		// # chunk is in the middle, copy the whole chunk
+		copy(dest[(i-firstChunk)*chunkSize-off%chunkSize:], f.chunkBuf[i])
+		slog.Debug("Read: copied middle chunk", "url", f.URL, "offset", off)
 	}
-
-	copy(dest, chunkData[relativeOffset:relativeOffset+bytesToRead])
-	slog.Debug("Read: completed", "url", f.URL, "offset", off, "bytes_read", bytesToRead)
-	return fuse.ReadResultData(dest[:bytesToRead]), fs.OK
+	slog.Debug("Read: completed", "url", f.URL, "offset", off, "bytes_read", readLength)
+	return fuse.ReadResultData(dest), fs.OK
 }
 
-// getChunk retrieves a specific chunk either from the cache or by fetching it via HTTP.
-func (f *httpFileHandle) getChunk(chunkIndex int64) ([]byte, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+// readChunkIntoCache retrieves a specific chunk either from the cache or by fetching it via HTTP.
+func (f *httpFileHandle) readChunkIntoCache(chunkIndex int64) error {
 
 	// Check if the chunk is already cached
-	if data, exists := f.chunkBuf[chunkIndex]; exists {
-		slog.Debug("getChunk: returning cached chunk", "url", f.URL, "chunk_index", chunkIndex)
-		return data, nil
+	f.mu.Lock()
+	if _, exists := f.chunkBuf[chunkIndex]; exists {
+		f.mu.Unlock()
+		slog.Debug("readChunkIntoCache: returning cached chunk", "url", f.URL, "chunk_index", chunkIndex)
+		return nil
 	}
+	f.mu.Unlock()
 
 	// Calculate the byte range for the chunk
 	startByte := chunkIndex * chunkSize
@@ -445,38 +461,40 @@ func (f *httpFileHandle) getChunk(chunkIndex int64) ([]byte, error) {
 	}
 
 	// Create a new HTTP request with the Range header
-	req, err := http.NewRequest("GET", f.URL, nil)
+	req, err := http.NewRequest(http.MethodGet, f.URL, nil)
 	if err != nil {
-		slog.Error("getChunk: creating GET request failed", "url", f.URL, "chunk_index", chunkIndex, "error", err)
-		return nil, fmt.Errorf("creating GET request: %w", err)
+		slog.Error("readChunkIntoCache: creating GET request failed", "url", f.URL, "chunk_index", chunkIndex, "error", err)
+		return fmt.Errorf("creating GET request: %w", err)
 	}
 	rangeHeader := fmt.Sprintf("bytes=%d-%d", startByte, endByte)
 	req.Header.Set("Range", rangeHeader)
 
-	slog.Debug("getChunk: fetching chunk", "url", f.URL, "range", rangeHeader)
+	slog.Debug("readChunkIntoCache: fetching chunk", "url", f.URL, "range", rangeHeader)
 	resp, err := f.HTTPClient.Do(req)
 	if err != nil {
-		slog.Error("getChunk: GET request failed", "url", f.URL, "range", rangeHeader, "error", err)
-		return nil, fmt.Errorf("performing GET request: %w", err)
+		slog.Error("readChunkIntoCache: GET request failed", "url", f.URL, "range", rangeHeader, "error", err)
+		return fmt.Errorf("performing GET request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
-		slog.Warn("getChunk: unexpected status code", "url", f.URL, "range", rangeHeader, "status_code", resp.StatusCode)
-		return nil, fmt.Errorf("unexpected status code %d for range request", resp.StatusCode)
+		slog.Warn("readChunkIntoCache: unexpected status code", "url", f.URL, "range", rangeHeader, "status_code", resp.StatusCode)
+		return fmt.Errorf("unexpected status code %d for range request", resp.StatusCode)
 	}
 
 	// Read the response body
 	chunkData, err := io.ReadAll(resp.Body)
 	if err != nil {
-		slog.Error("getChunk: reading response body failed", "url", f.URL, "range", rangeHeader, "error", err)
-		return nil, fmt.Errorf("reading response body: %w", err)
+		slog.Error("readChunkIntoCache: reading response body failed", "url", f.URL, "range", rangeHeader, "error", err)
+		return fmt.Errorf("reading response body: %w", err)
 	}
 
 	// Cache the chunk data
+	f.mu.Lock()
 	f.chunkBuf[chunkIndex] = chunkData
-	slog.Debug("getChunk: chunk fetched and cached", "url", f.URL, "chunk_index", chunkIndex, "chunk_size", len(chunkData))
-	return chunkData, nil
+	f.mu.Unlock()
+	slog.Debug("readChunkIntoCache: chunk fetched and cached", "url", f.URL, "chunk_index", chunkIndex, "chunk_size", len(chunkData))
+	return nil
 }
 
 func (f *httpFileHandle) Release(ctx context.Context) syscall.Errno {
