@@ -1,7 +1,7 @@
 # FLUFFH - FUSE Layer for Universal File Functionality via HTTP
 
 Language: Go
-Key dependencies: github.com/hanwen/go-fuse, github.com/colinmarc/cdb
+Key dependencies: github.com/hanwen/go-fuse, github.com/colinmarc/cdb, github.com/tinylib/msgp
 
 Goal: A FUSE layer that allows you to mount a specially prepared HTTP server/objectstore as a filesystem.
 
@@ -15,6 +15,11 @@ use case.
 
 hanwen/go-fuse seems a bit more modern than bazil/fuse. While having a steeper learning curve, it grants a lot more
 control over the filesystem.
+
+## Why tinylib/msgp
+
+msgp is a code generator for MessagePack. It is used to serialize the metadata of the files and directories. This is
+done to avoid the overhead of JSON and to make the CDB files as small as possible.
 
 ## Design
 
