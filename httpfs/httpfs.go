@@ -19,7 +19,7 @@ import (
 //go:generate go run github.com/tinylib/msgp
 
 const (
-	indexFile       = "index.cdb"
+	IndexFile       = "index.cdb"
 	chunkSize int64 = 1 << 20 // 1MB
 )
 
@@ -85,7 +85,7 @@ func getCDB(u string) (*cdb.CDB, error) {
 // fetchDirListing fetches the directory listing from the index file.
 func fetchDirListing(u string) (dirListing, error) {
 	var err error
-	u, err = url.JoinPath(u, indexFile)
+	u, err = url.JoinPath(u, IndexFile)
 	if err != nil {
 		return nil, fmt.Errorf("url.JoinPath: %w", err)
 	}
@@ -116,7 +116,7 @@ func fetchDirListing(u string) (dirListing, error) {
 
 func lookupInDir(u, filename string) (*FileMeta, error) {
 	var err error
-	u, err = url.JoinPath(u, indexFile)
+	u, err = url.JoinPath(u, IndexFile)
 	if err != nil {
 		return nil, fmt.Errorf("url.JoinPath: %w", err)
 	}
@@ -273,7 +273,7 @@ func (n *httpNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 	}
 
 	// Create a file handle that wraps resp.Body
-	fh, err := NewHttpFileHandle(n.URL, http.DefaultClient)
+	fh, err := newHttpFileHandle(n.URL, http.DefaultClient)
 	if err != nil {
 		return nil, 0, fs.ToErrno(err)
 	}
@@ -295,9 +295,9 @@ type httpFileHandle struct {
 	chunkBuf map[int64][]byte // Cache for chunks
 }
 
-// NewHttpFileHandle initializes a new httpFileHandle.
+// newHttpFileHandle initializes a new httpFileHandle.
 // It performs a HEAD request to determine the file size.
-func NewHttpFileHandle(url string, client *http.Client) (*httpFileHandle, error) {
+func newHttpFileHandle(url string, client *http.Client) (*httpFileHandle, error) {
 	if client == nil {
 		client = http.DefaultClient
 	}

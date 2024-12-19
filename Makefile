@@ -3,3 +3,7 @@ build:
 
 deps:
 	GOTOOLCHAIN=go1.24rc1 go mod download
+
+
+example:
+	GOTOOLCHAIN=go1.24rc1 go run indexgen/indexgen.go example

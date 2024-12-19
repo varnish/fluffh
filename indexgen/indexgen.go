@@ -40,7 +40,7 @@ func statToMetadata(path string, info os.FileInfo) (*httpfs.FileMeta, error) {
 
 // createIndexCDB creates a CDB index file for a single directory, listing only its immediate children.
 func createIndexCDB(directory string) error {
-	indexPath := filepath.Join(directory, "index.cdb")
+	indexPath := filepath.Join(directory, httpfs.IndexFile)
 	tempPath := indexPath + ".tmp"
 
 	entries, err := os.ReadDir(directory)
@@ -54,7 +54,7 @@ func createIndexCDB(directory string) error {
 	}
 	defer writer.Close()
 
-	var fileList []string
+	// var fileList []string // Needed if we want a list of all filenames somewhere.
 
 	for _, entry := range entries {
 		name := entry.Name()
@@ -65,8 +65,8 @@ func createIndexCDB(directory string) error {
 			return fmt.Errorf("Stat(%s): %w", p, err)
 		}
 
-		// Skip the index.cdb file itself if it exists.
-		if name == "index.cdb" {
+		// Skip the index file itself if it exists.
+		if name == httpfs.IndexFile {
 			continue
 		}
 
@@ -85,17 +85,19 @@ func createIndexCDB(directory string) error {
 			return fmt.Errorf("writer.Put(%s): %w", name, err)
 		}
 
-		fileList = append(fileList, name)
+		// fileList = append(fileList, name)
 	}
 
 	// Add __ALL__ entry listing all filenames
-	allData, err := json.Marshal(fileList)
-	if err != nil {
-		return fmt.Errorf("json.Marshal(fileList): %w", err)
-	}
-	if err := writer.Put([]byte("__ALL__"), allData); err != nil {
-		return fmt.Errorf("writer.Put(__ALL__): %w", err)
-	}
+	/*
+		allData, err := json.Marshal(fileList)
+		if err != nil {
+			return fmt.Errorf("json.Marshal(fileList): %w", err)
+		}
+		if err := writer.Put([]byte("__ALL__"), allData); err != nil {
+			return fmt.Errorf("writer.Put(__ALL__): %w", err)
+		}
+	*/
 
 	// Finalize the CDB file
 	if _, err := writer.Freeze(); err != nil {
