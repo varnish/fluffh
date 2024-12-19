@@ -1,5 +1,7 @@
 # FLUFFH - FUSE Layer for Universal File Functionality via HTTP
 
+(This is a work in progress, it might not even compile at any given time)
+
 Language: Go
 Key dependencies: github.com/hanwen/go-fuse, github.com/colinmarc/cdb, github.com/tinylib/msgp
 
