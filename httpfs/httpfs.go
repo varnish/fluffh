@@ -9,6 +9,7 @@ import (
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -60,16 +61,22 @@ var _ fs.NodeReaddirer = (*httpNode)(nil)
 var _ fs.NodeOpener = (*httpNode)(nil)
 
 func getCDB(u string) (*cdb.CDB, error) {
+	slog.Debug("getCDB: fetching CDB", "url", u)
 	resp, err := http.Get(u)
 	if err != nil {
+		slog.Error("http.Get failed", "url", u, "error", err)
 		return nil, fmt.Errorf("http.Get: %w", err)
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != 200 {
+		slog.Warn("Non-200 response code while fetching CDB", "url", u, "status_code", resp.StatusCode)
 		return nil, syscall.ENOENT
 	}
+
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
+		slog.Error("Error reading response body", "url", u, "error", err)
 		return nil, fmt.Errorf("io.ReadAll: %w", err)
 	}
 	// make reader
@@ -77,20 +84,27 @@ func getCDB(u string) (*cdb.CDB, error) {
 	// create cdb
 	dbase, err := cdb.New(readerBytes, nil)
 	if err != nil {
+		slog.Error("Error creating CDB database", "url", u, "error", err)
 		return nil, fmt.Errorf("cdb.New: %w", err)
 	}
+
+	slog.Debug("getCDB: successfully created CDB", "url", u)
 	return dbase, nil
 }
 
 // fetchDirListing fetches the directory listing from the index file.
 func fetchDirListing(u string) (dirListing, error) {
+	slog.Debug("fetchDirListing: start", "url", u)
 	var err error
 	u, err = url.JoinPath(u, IndexFile)
 	if err != nil {
+		slog.Error("Error joining path for index file", "base_url", u, "error", err)
 		return nil, fmt.Errorf("url.JoinPath: %w", err)
 	}
+
 	dbase, err := getCDB(u)
 	if err != nil {
+		slog.Error("fetchDirListing: getCDB failed", "url", u, "error", err)
 		return nil, fmt.Errorf("getCDB: %w", err)
 	}
 	// iterate over the cdb
@@ -98,10 +112,12 @@ func fetchDirListing(u string) (dirListing, error) {
 	var listing = make(dirListing)
 	i := 0
 	for {
-
-		// unmarshal the record into a FileMeta
+		if !iter.Next() {
+			break
+		}
 		var meta FileMeta
 		if _, err := meta.UnmarshalMsg(iter.Value()); err != nil {
+			slog.Error("Failed to unmarshal file metadata", "key", string(iter.Key()), "error", err)
 			return nil, fmt.Errorf("unmarshal metadata: %w", err)
 		}
 		listing[string(iter.Key())] = meta
@@ -111,45 +127,60 @@ func fetchDirListing(u string) (dirListing, error) {
 			break // no more records
 		}
 	}
+
+	slog.Debug("fetchDirListing: fetched directory listing", "url", u, "count", i)
 	return listing, nil
 }
 
 func lookupInDir(u, filename string) (*FileMeta, error) {
+	slog.Debug("lookupInDir: start", "dir_url", u, "filename", filename)
 	var err error
 	u, err = url.JoinPath(u, IndexFile)
 	if err != nil {
+		slog.Error("Error joining path to index file", "base_url", u, "filename", filename, "error", err)
 		return nil, fmt.Errorf("url.JoinPath: %w", err)
 	}
+
 	dbase, err := getCDB(u)
 	if err != nil {
+		slog.Error("lookupInDir: getCDB failed", "url", u, "filename", filename, "error", err)
 		return nil, fmt.Errorf("getCDB: %w", err)
 	}
 
 	// lookup in the cdb
-	var meta FileMeta
 	value, err := dbase.Get([]byte(filename))
 	if err != nil {
+		slog.Error("CDB Get failed", "url", u, "filename", filename, "error", err)
 		return nil, fmt.Errorf("cdb.Get: %w", err)
 	}
 	if value == nil {
+		slog.Warn("File not found in directory index", "url", u, "filename", filename)
 		return nil, syscall.ENOENT
 	}
+
+	var meta FileMeta
 	if _, err := meta.UnmarshalMsg(value); err != nil {
+		slog.Error("Failed to unmarshal file metadata", "url", u, "filename", filename, "error", err)
 		return nil, fmt.Errorf("unmarshal metadata: %w", err)
 	}
+
+	slog.Debug("lookupInDir: found file metadata", "url", u, "filename", filename, "meta", meta)
 	return &meta, nil
 }
 
 // NewHttpRoot initializes the HTTP root node.
 func NewHttpRoot(baseURL string) (fs.InodeEmbedder, error) {
+	slog.Info("NewHttpRoot: initializing HTTP root", "baseURL", baseURL)
 	if !strings.HasSuffix(baseURL, "/") {
 		baseURL += "/"
 	}
+
 	root := &httpRoot{
 		BaseURL: baseURL,
 	}
 	// Default NewNode function if none provided
 	root.NewNode = func(r *httpRoot, parent *fs.Inode, name, url string, meta FileMeta) fs.InodeEmbedder {
+		slog.Debug("NewHttpRoot: creating new node", "name", name, "url", url, "meta", meta)
 		return &httpNode{
 			RootData: r,
 			URL:      url,
@@ -161,6 +192,7 @@ func NewHttpRoot(baseURL string) (fs.InodeEmbedder, error) {
 	// Fetch root dir metadata to ensure it's a directory.
 	_, err := fetchDirListing(baseURL)
 	if err != nil {
+		slog.Error("Failed to fetch root directory listing", "baseURL", baseURL, "error", err)
 		return nil, err
 	}
 
@@ -181,6 +213,7 @@ func NewHttpRoot(baseURL string) (fs.InodeEmbedder, error) {
 		Meta:     meta,
 	}
 
+	slog.Info("NewHttpRoot: initialized root node successfully", "baseURL", baseURL)
 	return rootNode, nil
 }
 
@@ -191,7 +224,7 @@ func (n *httpNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errn
 
 // Getattr retrieves attributes for this node.
 func (n *httpNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	// If it's a directory, we have Meta already. If it's a file, we also have Meta.
+	slog.Debug("Getattr called", "url", n.URL, "isDir", n.IsDir, "meta", n.Meta)
 	out.Mode = n.Meta.Mode
 	out.Size = n.Meta.Size
 	out.Uid = n.Meta.UID
@@ -204,20 +237,23 @@ func (n *httpNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.Attr
 
 // Lookup a child node by name.
 func (n *httpNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	// Obviously we can't look up children of a file, duh.
+	slog.Debug("Lookup called", "dir_url", n.URL, "name", name)
+
 	if !n.IsDir {
-		// Not a directory, no children.
+		slog.Warn("Attempted lookup on a file node", "url", n.URL, "name", name)
 		return nil, syscall.ENOENT
 	}
 
 	// Fetch directory listing
 	listing, err := fetchDirListing(n.URL)
 	if err != nil {
+		slog.Error("Lookup: failed to fetch directory listing", "url", n.URL, "name", name, "error", err)
 		return nil, fs.ToErrno(err)
 	}
 
 	meta, ok := listing[name]
 	if !ok {
+		slog.Warn("Lookup: file not found in directory listing", "url", n.URL, "name", name)
 		return nil, syscall.ENOENT
 	}
 
@@ -232,52 +268,60 @@ func (n *httpNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 		Mode: meta.Mode,
 		Ino:  meta.INO,
 	})
+
 	out.Attr.Mode = meta.Mode
 	out.Attr.Size = meta.Size
 	out.Attr.Uid = meta.UID
 	out.Attr.Gid = meta.GID
 	out.Attr.Ino = meta.INO
+	slog.Debug("Lookup: child node created successfully", "url", entryURL)
 	return ch, 0
 }
 
 // Readdir reads the directory contents.
 func (n *httpNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	slog.Debug("Readdir called", "url", n.URL, "isDir", n.IsDir)
 	if !n.IsDir {
+		slog.Warn("Readdir attempted on a file node", "url", n.URL)
 		return nil, syscall.ENOTDIR
 	}
 
 	listing, err := fetchDirListing(n.URL)
 	if err != nil {
+		slog.Error("Readdir: failed to fetch directory listing", "url", n.URL, "error", err)
 		return nil, fs.ToErrno(err)
 	}
 
 	entries := make([]fuse.DirEntry, 0, len(listing))
 	for name, meta := range listing {
-		e := fuse.DirEntry{
+		entries = append(entries, fuse.DirEntry{
 			Name: name,
 			Ino:  meta.INO,
 			Mode: meta.Mode,
-		}
-		entries = append(entries, e)
+		})
 	}
 
+	slog.Debug("Readdir: returning directory entries", "url", n.URL, "count", len(entries))
 	return fs.NewListDirStream(entries), fs.OK
 }
 
 // Open opens a file. For directories, this might be used to read directories if needed.
 // For files, it will initiate an HTTP GET request.
 func (n *httpNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	slog.Debug("Open called", "url", n.URL, "isDir", n.IsDir)
 	if n.IsDir {
-		// Just return nil and OK.
+		slog.Debug("Open: directory node opened, returning nil file handle", "url", n.URL)
 		return nil, 0, 0
 	}
 
 	// Create a file handle that wraps resp.Body
 	fh, err := newHttpFileHandle(n.URL, http.DefaultClient)
 	if err != nil {
+		slog.Error("Open: failed to open file", "url", n.URL, "error", err)
 		return nil, 0, fs.ToErrno(err)
 	}
 
+	slog.Debug("Open: file handle created successfully", "url", n.URL)
 	return fh, 0, 0
 }
 
@@ -287,17 +331,18 @@ var _ fs.FileReleaser = (*httpFileHandle)(nil)
 
 // httpFileHandle represents a file handle for an HTTP-based file.
 type httpFileHandle struct {
-	URL        string       // URL of the remote file
-	HTTPClient *http.Client // HTTP client to make requests
-	FileSize   int64        // Size of the remote file
+	URL        string
+	HTTPClient *http.Client
+	FileSize   int64
 
-	mu       sync.Mutex       // Mutex to protect concurrent access
-	chunkBuf map[int64][]byte // Cache for chunks
+	mu       sync.Mutex
+	chunkBuf map[int64][]byte
 }
 
 // newHttpFileHandle initializes a new httpFileHandle.
 // It performs a HEAD request to determine the file size.
 func newHttpFileHandle(url string, client *http.Client) (*httpFileHandle, error) {
+	slog.Debug("newHttpFileHandle: initializing", "url", url)
 	if client == nil {
 		client = http.DefaultClient
 	}
@@ -305,31 +350,37 @@ func newHttpFileHandle(url string, client *http.Client) (*httpFileHandle, error)
 	// Perform a HEAD request to get the file size
 	req, err := http.NewRequest("HEAD", url, nil)
 	if err != nil {
+		slog.Error("newHttpFileHandle: creating HEAD request failed", "url", url, "error", err)
 		return nil, fmt.Errorf("creating HEAD request: %w", err)
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
+		slog.Error("newHttpFileHandle: HEAD request failed", "url", url, "error", err)
 		return nil, fmt.Errorf("performing HEAD request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		slog.Warn("newHttpFileHandle: non-200 HEAD response", "url", url, "status_code", resp.StatusCode)
 		return nil, fmt.Errorf("unexpected status code %d on HEAD request", resp.StatusCode)
 	}
 
 	// Extract the Content-Length header to determine file size
 	contentLength := resp.Header.Get("Content-Length")
 	if contentLength == "" {
+		slog.Error("newHttpFileHandle: no Content-Length in HEAD response", "url", url)
 		return nil, errors.New("Content-Length header is missing")
 	}
 
 	var fileSize int64
 	_, err = fmt.Sscanf(contentLength, "%d", &fileSize)
 	if err != nil {
+		slog.Error("newHttpFileHandle: parsing Content-Length failed", "url", url, "error", err)
 		return nil, fmt.Errorf("parsing Content-Length: %w", err)
 	}
 
+	slog.Debug("newHttpFileHandle: file handle initialized", "url", url, "size", fileSize)
 	return &httpFileHandle{
 		URL:        url,
 		HTTPClient: client,
@@ -341,8 +392,10 @@ func newHttpFileHandle(url string, client *http.Client) (*httpFileHandle, error)
 // Read fetches a specific range of bytes from the remote file.
 // It uses chunk-based HTTP range requests to optimize memory usage and performance.
 func (f *httpFileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	// Validate the offset
+	slog.Debug("Read called", "url", f.URL, "offset", off, "bytes_requested", len(dest))
+
 	if off < 0 || off >= f.FileSize {
+		slog.Warn("Read: invalid offset", "url", f.URL, "offset", off, "file_size", f.FileSize)
 		return nil, syscall.EINVAL
 	}
 
@@ -352,45 +405,24 @@ func (f *httpFileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse
 		readLength = f.FileSize - off
 	}
 
-	// Calculate the starting and ending byte positions
-	startByte := off
-	// 	endByte := off + readLength - 1 // not used
+	chunkIndex := off / chunkSize
 
-	// Identify the chunk index based on the starting byte
-	chunkIndex := startByte / chunkSize
-	chunkStart := chunkIndex * chunkSize
-	chunkEnd := chunkStart + chunkSize - 1
-	if chunkEnd >= f.FileSize {
-		chunkEnd = f.FileSize - 1
-	}
-
-	// Calculate the relative offset within the chunk
-	relativeOffset := startByte - chunkStart
-
-	// Determine the number of bytes to read from the chunk
-	bytesToRead := readLength
-	if relativeOffset+bytesToRead > chunkSize {
-		bytesToRead = chunkSize - relativeOffset
-		if chunkStart+chunkSize > f.FileSize {
-			bytesToRead = f.FileSize - chunkStart - relativeOffset
-		}
-	}
-
-	// Fetch the required chunk (with caching)
 	chunkData, err := f.getChunk(chunkIndex)
 	if err != nil {
+		slog.Error("Read: getChunk failed", "url", f.URL, "offset", off, "error", err)
 		return nil, fs.ToErrno(err)
 	}
 
-	// Ensure we don't read beyond the chunk data
+	chunkStart := chunkIndex * chunkSize
+	relativeOffset := off - chunkStart
+	bytesToRead := readLength
+
 	if relativeOffset+bytesToRead > int64(len(chunkData)) {
 		bytesToRead = int64(len(chunkData)) - relativeOffset
 	}
 
-	// Copy the relevant part of the chunk into dest
 	copy(dest, chunkData[relativeOffset:relativeOffset+bytesToRead])
-
-	// Return the number of bytes read
+	slog.Debug("Read: completed", "url", f.URL, "offset", off, "bytes_read", bytesToRead)
 	return fuse.ReadResultData(dest[:bytesToRead]), fs.OK
 }
 
@@ -401,6 +433,7 @@ func (f *httpFileHandle) getChunk(chunkIndex int64) ([]byte, error) {
 
 	// Check if the chunk is already cached
 	if data, exists := f.chunkBuf[chunkIndex]; exists {
+		slog.Debug("getChunk: returning cached chunk", "url", f.URL, "chunk_index", chunkIndex)
 		return data, nil
 	}
 
@@ -414,37 +447,39 @@ func (f *httpFileHandle) getChunk(chunkIndex int64) ([]byte, error) {
 	// Create a new HTTP request with the Range header
 	req, err := http.NewRequest("GET", f.URL, nil)
 	if err != nil {
+		slog.Error("getChunk: creating GET request failed", "url", f.URL, "chunk_index", chunkIndex, "error", err)
 		return nil, fmt.Errorf("creating GET request: %w", err)
 	}
 	rangeHeader := fmt.Sprintf("bytes=%d-%d", startByte, endByte)
 	req.Header.Set("Range", rangeHeader)
 
-	// Execute the HTTP request
+	slog.Debug("getChunk: fetching chunk", "url", f.URL, "range", rangeHeader)
 	resp, err := f.HTTPClient.Do(req)
 	if err != nil {
+		slog.Error("getChunk: GET request failed", "url", f.URL, "range", rangeHeader, "error", err)
 		return nil, fmt.Errorf("performing GET request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Expecting a 206 Partial Content response
 	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+		slog.Warn("getChunk: unexpected status code", "url", f.URL, "range", rangeHeader, "status_code", resp.StatusCode)
 		return nil, fmt.Errorf("unexpected status code %d for range request", resp.StatusCode)
 	}
 
 	// Read the response body
 	chunkData, err := io.ReadAll(resp.Body)
 	if err != nil {
+		slog.Error("getChunk: reading response body failed", "url", f.URL, "range", rangeHeader, "error", err)
 		return nil, fmt.Errorf("reading response body: %w", err)
 	}
 
 	// Cache the chunk data
 	f.chunkBuf[chunkIndex] = chunkData
-
+	slog.Debug("getChunk: chunk fetched and cached", "url", f.URL, "chunk_index", chunkIndex, "chunk_size", len(chunkData))
 	return chunkData, nil
 }
 
 func (f *httpFileHandle) Release(ctx context.Context) syscall.Errno {
-	// f.Body.Close()
-	// will the garbage collector take care of this?
+	slog.Debug("Release called", "url", f.URL)
 	return fs.OK
 }
