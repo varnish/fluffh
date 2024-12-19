@@ -28,7 +28,7 @@ const (
 type httpRoot struct {
 	BaseURL string
 	// NewNode creates a new node given a URL and metadata.
-	NewNode func(root *httpRoot, parent *fs.Inode, name, url string, meta FileMeta) fs.InodeEmbedder
+	NewNode func(root *httpRoot, parent *fs.Inode, name, url string, meta *FileMeta) fs.InodeEmbedder
 }
 
 // FileMeta holds the metadata for a file or directory as read from the index CDB
@@ -50,7 +50,7 @@ type httpNode struct {
 	RootData *httpRoot
 	URL      string
 	IsDir    bool
-	Meta     FileMeta
+	Meta     *FileMeta
 }
 
 // Ensure httpNode implements certain interfaces:
@@ -93,6 +93,7 @@ func getCDB(u string) (*cdb.CDB, error) {
 }
 
 // fetchDirListing fetches the directory listing from the index file.
+// used by Readdir
 func fetchDirListing(u string) (dirListing, error) {
 	slog.Debug("fetchDirListing: start", "url", u)
 	var err error
@@ -179,7 +180,7 @@ func NewHttpRoot(baseURL string) (fs.InodeEmbedder, error) {
 		BaseURL: baseURL,
 	}
 	// Default NewNode function if none provided
-	root.NewNode = func(r *httpRoot, parent *fs.Inode, name, url string, meta FileMeta) fs.InodeEmbedder {
+	root.NewNode = func(r *httpRoot, parent *fs.Inode, name, url string, meta *FileMeta) fs.InodeEmbedder {
 		slog.Debug("NewHttpRoot: creating new node", "name", name, "url", url, "meta", meta)
 		return &httpNode{
 			RootData: r,
@@ -198,7 +199,7 @@ func NewHttpRoot(baseURL string) (fs.InodeEmbedder, error) {
 
 	// The root node metadata can be taken from the directory itself if provided, or synthesized.
 	// We'll assume the directory entry for '.' is not explicitly given, so we synthesize:
-	meta := FileMeta{
+	meta := &FileMeta{
 		Size: 0,
 		UID:  0,
 		GID:  0,
@@ -244,17 +245,12 @@ func (n *httpNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) 
 		return nil, syscall.ENOENT
 	}
 
-	// Fetch directory listing
-	listing, err := fetchDirListing(n.URL)
-	if err != nil {
-		slog.Error("Lookup: failed to fetch directory listing", "url", n.URL, "name", name, "error", err)
-		return nil, fs.ToErrno(err)
-	}
+	// Get entry from directory listing
 
-	meta, ok := listing[name]
-	if !ok {
-		slog.Warn("Lookup: file not found in directory listing", "url", n.URL, "name", name)
-		return nil, syscall.ENOENT
+	meta, err := lookupInDir(n.URL, name)
+	if err != nil {
+		slog.Error("Lookup: failed to lookup entry in directory", "url", n.URL, "name", name, "error", err)
+		return nil, fs.ToErrno(err)
 	}
 
 	// Construct URL for this entry
