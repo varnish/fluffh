@@ -111,11 +111,13 @@ func main() {
 	// Setup filesystem options
 	timeout := time.Second
 	opts := &fs.Options{
-		AttrTimeout:     &timeout,
-		EntryTimeout:    &timeout,
-		NullPermissions: true, // keep file permissions as-is
+		AttrTimeout:     &timeout,                                   // Todo: tweak these values
+		EntryTimeout:    &timeout,                                   // Todo: tweak these values
+		RootStableAttr:  &fs.StableAttr{Ino: 1, Mode: fuse.S_IFDIR}, // Todo: verify that this is correct / smart.
+		NullPermissions: true,                                       // keep file permissions as-is
 
 		MountOptions: fuse.MountOptions{
+			MaxReadAhead:      10 * 1024 * 1024, // 10 MB read-ahead. This is quite large.
 			AllowOther:        *allowOther,
 			Debug:             *debug,
 			DirectMount:       *directmount,

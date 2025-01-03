@@ -9,7 +9,7 @@ Goal: A FUSE layer that allows you to mount a specially prepared HTTP server/obj
 
 ## Why CDB?
 
-CVMFS uses SQLite databases to store the filesystem metadata. SQLite is great, but a lot more complex than CDB. CDB is
+CVM-FS uses SQLite databases to store the filesystem metadata. SQLite is great, but a lot more complex than CDB. CDB is
 a simple key-value store that is very fast and very simple. It is also made to be read-only, which is perfect for our
 use case.
 
@@ -32,7 +32,7 @@ cumbersome data ingest pipeline of CVMFS.
 ## Caveats
 
 * Filesystems is mounted read only.
-* File are not assumed to change, but they can. S3 does support versioning and if the CDB files somehow can reference a
+* A file are not assumed to change, but they can. S3 does support versioning and if the CDB files somehow can reference a
   version, we can support this.
 * Directories can change.
 
