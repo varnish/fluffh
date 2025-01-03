@@ -40,7 +40,7 @@ func (f *httpFileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse
 	for i := firstChunk; i <= lastChunk; i++ {
 		_, exists := f.chunkBuf[i]
 		if !exists {
-			if err := f.readChunkIntoCache(i); err != nil {
+			if err := f.readChunkIntoCache(ctx, i); err != nil {
 				slog.Error("Read: readChunkIntoCache failed", "url", f.URL, "offset", off, "error", err)
 				return nil, fs.ToErrno(err)
 			}
@@ -81,7 +81,7 @@ func (f *httpFileHandle) Release(ctx context.Context) syscall.Errno {
 
 // readChunkIntoCache retrieves a specific chunk either from the cache or by fetching it via HTTP.
 // The chunk is stored in the chunkBuf map. This code can be called concurrently.
-func (f *httpFileHandle) readChunkIntoCache(chunkIndex int64) error {
+func (f *httpFileHandle) readChunkIntoCache(ctx context.Context, chunkIndex int64) error {
 	// Check if the chunk is already cached
 	f.mu.Lock()
 	if _, exists := f.chunkBuf[chunkIndex]; exists {
@@ -99,7 +99,7 @@ func (f *httpFileHandle) readChunkIntoCache(chunkIndex int64) error {
 	}
 
 	// Create a new HTTP request with the Range header
-	req, err := http.NewRequest(http.MethodGet, f.URL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.URL, nil)
 	if err != nil {
 		slog.Error("readChunkIntoCache: creating GET request failed", "url", f.URL, "chunk_index", chunkIndex, "error", err)
 		return fmt.Errorf("creating GET request: %w", err)
