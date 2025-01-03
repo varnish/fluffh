@@ -63,22 +63,6 @@ The chunk size should align with the Varnish Cache Slicer size.
 
 ## CDB Files
 
-Each directory is represented by a CDB file. The keys are the filename, the values are the inode, encoded as JSON.
+Each directory is represented by a CDB file. The keys are the filename, the values are the metadata of the file, 
+encoded as MessagePack. See `httpfs/types.go` for the structure of the metadata.
 
-JSON structure:
-
-```go 
-package fluffh
-
-type Metadata struct {
-	Inode      uint64 `json:"inode"`
-	Type       string `json:"type"`       // "file" or "dir"
-	AccessBits uint32 `json:"accessBits"` // Permissions
-	UID        uint32 `json:"uid"`
-	GID        uint32 `json:"gid"`
-	Size       int64  `json:"size"`
-	Modified   int64  `json:"modified"`
-	Created    int64  `json:"created"`
-}
-
-```
