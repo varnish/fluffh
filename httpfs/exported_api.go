@@ -63,7 +63,10 @@ func NewHttpRoot(baseURL string) (fs.InodeEmbedder, error) {
 	return rootNode, nil
 }
 
-func (n *httpNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
+// Statfs retrieves filesystem statistics.
+// Todo: This could be implemented by returning a encoded struct stored at the root with a magic name
+// like ".statfs" or something.
+func (n *httpNode) Statfs(_ context.Context, out *fuse.StatfsOut) syscall.Errno {
 	// Just return zeros as suggested.
 	return 0
 }
